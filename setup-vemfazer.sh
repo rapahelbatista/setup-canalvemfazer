@@ -3048,10 +3048,11 @@ stack_editavel(){
     erro_output=$(mktemp)
     response_output=$(mktemp)
 
-    ## Verifica se já existe uma stack com o mesmo nome (de tentativa anterior) e remove
-    EXISTING_STACK_ID=$(curl -k -s -X GET -H "Authorization: Bearer $TOKEN" \
-        "https://$PORTAINER_URL/api/stacks" \
-        | jq -r --arg name "$STACK_NAME" '.[] | select(.Name == $name) | .Id' | head -n1)
+    ## Verifica se já existe uma stack com o mesmo nome (ou nome normalizado) e remove
+    NORMALIZED_STACK_NAME=$(printf "%s" "$STACK_NAME" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]//g')
+    STACKS_RESPONSE=$(curl -k -s -X GET -H "Authorization: Bearer $TOKEN" \
+        "https://$PORTAINER_URL/api/stacks")
+    EXISTING_STACK_ID=$(printf "%s" "$STACKS_RESPONSE" | jq -r --arg name "$STACK_NAME" --arg normalized "$NORMALIZED_STACK_NAME" '.[] | select((.Name | ascii_downcase) == ($name | ascii_downcase) or ((.Name | ascii_downcase | gsub("[^a-z0-9]"; "")) == $normalized)) | .Id' | head -n1)
 
     if [ -n "$EXISTING_STACK_ID" ] && [ "$EXISTING_STACK_ID" != "null" ]; then
         echo -e "$bege[ AVISO ]$reset Stack '$STACK_NAME' já existe (ID: $EXISTING_STACK_ID). Removendo antes de recriar..."
@@ -3085,10 +3086,41 @@ stack_editavel(){
 
     response_body=$(cat "$response_output")
 
+    if [ "$http_code" -eq 409 ]; then
+        EXISTING_STACK_ID=$(curl -k -s -X GET -H "Authorization: Bearer $TOKEN" \
+            "https://$PORTAINER_URL/api/stacks" \
+            | jq -r --arg name "$STACK_NAME" --arg normalized "$NORMALIZED_STACK_NAME" '.[] | select((.Name | ascii_downcase) == ($name | ascii_downcase) or ((.Name | ascii_downcase | gsub("[^a-z0-9]"; "")) == $normalized)) | .Id' | head -n1)
+
+        if [ -n "$EXISTING_STACK_ID" ] && [ "$EXISTING_STACK_ID" != "null" ]; then
+            echo -e "[ AVISO ] Portainer ainda encontrou a stack '$STACK_NAME' (ID: $EXISTING_STACK_ID). Removendo e tentando novamente..."
+            curl -k -s -o /dev/null -X DELETE \
+                -H "Authorization: Bearer $TOKEN" \
+                "https://$PORTAINER_URL/api/stacks/$EXISTING_STACK_ID?endpointId=$ENDPOINT_ID"
+
+            for i in $(seq 1 30); do
+                docker stack services "$STACK_NAME" >/dev/null 2>&1 || break
+                sleep 2
+            done
+
+            http_code=$(curl -s -o "$response_output" -w "%{http_code}" -k -X POST \
+            -H "Authorization: Bearer $TOKEN" \
+            -F "Name=$STACK_NAME" \
+            -F "file=@$(pwd)/$STACK_NAME.yaml" \
+            -F "SwarmID=$SWARM_ID" \
+            -F "endpointId=$ENDPOINT_ID" \
+            "https://$PORTAINER_URL/api/stacks/create/swarm/file" 2> "$erro_output")
+
+            response_body=$(cat "$response_output")
+        fi
+    fi
+
     if [ "$http_code" -eq 200 ]; then
         # Verifica o conteúdo da resposta para garantir que o deploy foi bem-sucedido
         if echo "$response_body" | grep -q "\"Id\""; then
             echo -e "10/10 - [ OK ] - Deploy da stack $bege$STACK_NAME$reset feito com sucesso!"
+            rm "$erro_output"
+            rm "$response_output"
+            return 0
         else
             echo -e "10/10 - [ OFF ] - Erro, resposta inesperada do servidor ao tentar efetuar deploy da stack $bege$STACK_NAME$reset."
             echo "Resposta do servidor: $(echo "$response_body" | jq .)"
@@ -3104,6 +3136,7 @@ stack_editavel(){
     # Remove os arquivos temporários
     rm "$erro_output"
     rm "$response_output"
+    return 1
 }
 
 ## Função para verificar se o arquivo de dados do Portainer existe
@@ -6258,7 +6291,11 @@ else
     echo "Não foi possivel criar a stack do Whaticket"
 fi
 STACK_NAME="whaticket${1:+_$1}"
-stack_editavel
+if ! stack_editavel; then
+    echo ""
+    echo "Instalação interrompida porque o deploy da stack Whaticket falhou."
+    return 1
+fi
 
 ## Mensagem de Passo
 echo -e "\e[97m• BAIXANDO IMAGENS DO WHATICKET \e[33m[3/5]\e[0m"
